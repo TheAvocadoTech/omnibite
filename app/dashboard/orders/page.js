@@ -12,13 +12,14 @@ export default function Orders() {
   const [view, setView] = useState('kanban');
   const [rid, setRid] = useState(null);
   const [cur, setCur] = useState('₹');
+  const [info, setInfo] = useState(null);
   const [fresh, setFresh] = useState({});
   const [, tick] = useState(0);
   const audio = useRef(null);
 
   useEffect(() => {
     fetch('/api/orders').then((r) => r.json()).then((d) => setOrders(d.orders || []));
-    fetch('/api/settings').then((r) => r.json()).then((d) => { setRid(d.restaurant._id); setCur(d.restaurant.currency); });
+    fetch('/api/settings').then((r) => r.json()).then((d) => { setRid(d.restaurant._id); setCur(d.restaurant.currency); setInfo(d.restaurant); });
     const t = setInterval(() => tick((n) => n + 1), 30000); // refresh "x min ago"
     return () => clearInterval(t);
   }, []);
@@ -55,14 +56,81 @@ export default function Orders() {
 
   async function receipt(o) {
     const { jsPDF } = await import('jspdf');
-    const doc = new jsPDF({ unit: 'mm', format: [80, 50 + o.items.length * 7] });
-    let y = 10;
-    doc.setFontSize(13); doc.text(`Order #${o.number}`, 40, y, { align: 'center' }); y += 6;
-    doc.setFontSize(9); doc.text(`Table ${o.table}  |  ${new Date(o.createdAt).toLocaleString()}`, 40, y, { align: 'center' }); y += 8;
-    o.items.forEach((i) => { doc.text(`${i.qty} x ${i.name}${i.size ? ` (${i.size})` : ''}`, 5, y); doc.text(`${i.qty * i.price}`, 75, y, { align: 'right' }); y += 6; });
-    y += 2; doc.text('Subtotal', 5, y); doc.text(`${o.subtotal}`, 75, y, { align: 'right' }); y += 5;
-    doc.text('Tax', 5, y); doc.text(`${o.tax}`, 75, y, { align: 'right' }); y += 6;
-    doc.setFontSize(11); doc.text('Total', 5, y); doc.text(`${o.total}`, 75, y, { align: 'right' });
+    const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+    const W = 210, L = 15, R = W - 15;
+    const money = (n) => `Rs. ${Number(n || 0).toFixed(2)}`; // default PDF fonts have no rupee glyph
+    const RED = [214, 40, 40], INK = [31, 20, 20], MUTED = [111, 99, 97], LINE = [234, 222, 220];
+    const when = new Date(o.createdAt);
+    const rest = info || {};
+
+    // Header band
+    doc.setFillColor(...RED); doc.rect(0, 0, W, 34, 'F');
+    doc.setTextColor(255, 255, 255); doc.setFont('helvetica', 'bold'); doc.setFontSize(20);
+    doc.text(rest.name || 'Restaurant', L, 16);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(9);
+    const sub = [rest.address, rest.phone && `Ph: ${rest.phone}`].filter(Boolean).join('  |  ');
+    if (sub) doc.text(doc.splitTextToSize(sub, 120), L, 23);
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(16); doc.text('ORDER STATEMENT', R, 16, { align: 'right' });
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.text(`Order #${o.number}`, R, 23, { align: 'right' });
+
+    // Order details
+    let y = 46;
+    doc.setTextColor(...INK);
+    const field = (label, value, x) => {
+      doc.setFontSize(8); doc.setTextColor(...MUTED); doc.text(label.toUpperCase(), x, y);
+      doc.setFontSize(11); doc.setTextColor(...INK); doc.setFont('helvetica', 'bold'); doc.text(String(value), x, y + 6); doc.setFont('helvetica', 'normal');
+    };
+    field('Order no.', `#${o.number}`, L);
+    field('Table', o.table, L + 40);
+    field('Date', when.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }), L + 70);
+    field('Time', when.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }), L + 112);
+    field('Status', o.status, L + 145);
+    y += 16;
+    if (o.customerName) { field('Customer', o.customerName, L); y += 16; }
+
+    // Items table header
+    y += 2;
+    doc.setFillColor(253, 232, 230); doc.rect(L, y, R - L, 9, 'F');
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(9); doc.setTextColor(...INK);
+    doc.text('#', L + 3, y + 6); doc.text('ITEM', L + 12, y + 6);
+    doc.text('QTY', 128, y + 6, { align: 'right' }); doc.text('RATE', 158, y + 6, { align: 'right' }); doc.text('AMOUNT', R - 3, y + 6, { align: 'right' });
+    y += 9; doc.setFont('helvetica', 'normal');
+
+    const newPage = () => { doc.addPage(); y = 20; };
+    o.items.forEach((i, k) => {
+      const extra = [i.size && `Size: ${i.size}`, i.addons?.length && `Add-ons: ${i.addons.join(', ')}`, i.note && `Note: ${i.note}`].filter(Boolean);
+      const nameLines = doc.splitTextToSize(i.name || '', 85);
+      const h = 5 + nameLines.length * 5 + extra.length * 4 + 2;
+      if (y + h > 265) newPage();
+      doc.setFontSize(10); doc.setTextColor(...INK);
+      doc.text(String(k + 1), L + 3, y + 6);
+      doc.text(nameLines, L + 12, y + 6);
+      doc.text(String(i.qty), 128, y + 6, { align: 'right' });
+      doc.text(money(i.price), 158, y + 6, { align: 'right' });
+      doc.text(money(i.qty * i.price), R - 3, y + 6, { align: 'right' });
+      let yy = y + 6 + (nameLines.length - 1) * 5;
+      doc.setFontSize(8); doc.setTextColor(...MUTED);
+      extra.forEach((t) => { yy += 4; doc.text(doc.splitTextToSize(t, 90), L + 12, yy); });
+      y += h + 2;
+      doc.setDrawColor(...LINE); doc.line(L, y, R, y);
+    });
+
+    // Totals
+    if (y + 40 > 275) newPage();
+    y += 8;
+    const row = (label, value, bold) => {
+      doc.setFont('helvetica', bold ? 'bold' : 'normal'); doc.setFontSize(bold ? 13 : 10); doc.setTextColor(...INK);
+      doc.text(label, 130, y); doc.text(value, R - 3, y, { align: 'right' }); y += bold ? 8 : 6;
+    };
+    row('Subtotal', money(o.subtotal));
+    row(`Tax${rest.taxRate != null ? ` (${rest.taxRate}%)` : ''}`, money(o.tax));
+    doc.setDrawColor(...RED); doc.setLineWidth(0.5); doc.line(130, y - 2, R, y - 2); y += 4;
+    row('TOTAL', money(o.total), true);
+
+    // Footer
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(10); doc.setTextColor(...MUTED);
+    doc.text('Thank you for dining with us!', W / 2, 280, { align: 'center' });
+    doc.setFontSize(8); doc.text('Powered by OmniBite by Avocado Technologies', W / 2, 285, { align: 'center' });
     doc.save(`order-${o.number}.pdf`);
   }
 
